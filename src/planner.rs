@@ -1,50 +1,19 @@
 //! Forward-chaining planner — executes ontology actions on entities.
-//! Produces telemetry records for SAM classifier training.
+//! Uses unified models::TelemetryRecord and models::BusinessOntology.
+//! No duplicate types — single source of truth in models.rs.
 
+use crate::engine::GovernanceRegistry;
 use crate::iggy::IggyBus;
 use crate::models::*;
-use chrono::Utc;
-use serde_json::json;
-use std::collections::HashMap;
-use uuid::Uuid;
+use std::collections::BTreeMap;
 
-#[derive(Clone)]
-pub struct TelemetryRecord {
-    pub run_id: String,
-    pub entity_id: String,
-    pub timestep: usize,
-    pub n_actions: usize,
-    pub n_props: usize,
-    pub elapsed_us: u64,
-    pub label: i32,  // 0 = ok, 1 = distressed
-}
-
-impl TelemetryRecord {
-    pub fn to_json(&self) -> serde_json::Value {
-        json!({
-            "run_id": self.run_id, "entity_id": self.entity_id,
-            "timestep": self.timestep, "n_actions": self.n_actions,
-            "n_props": self.n_props, "elapsed_us": self.elapsed_us,
-            "label": self.label,
-        })
-    }
-
-    pub fn features(&self) -> [f64; 4] {
-        [
-            self.n_actions as f64,
-            self.n_props as f64,
-            self.elapsed_us as f64,
-            self.timestep as f64,
-        ]
-    }
-}
-
-/// Rail fleet ontology with depart/arrive/clear_delay/emergency_stop
+/// Rail fleet ontology with depart/arrive/clear_delay/emergency_stop.
+/// Returns the canonical BusinessOntology from models.rs.
 pub fn build_rail_ontology(max_steps: usize) -> BusinessOntology {
-    let kv = |pairs: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+    let kv = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
     };
-    let mut actions = std::collections::BTreeMap::new();
+    let mut actions = BTreeMap::new();
     actions.insert("depart".into(), ActionDef {
         input_state: kv(&[("status", "idle"), ("location", "platform")]),
         output_state: kv(&[("status", "running"), ("location", "en_route"), ("speed", "normal")]),
@@ -79,7 +48,7 @@ pub fn build_rail_ontology(max_steps: usize) -> BusinessOntology {
         version: "4.0.0".into(),
         max_timesteps: max_steps,
         concepts: vec!["train".into(), "station".into(), "controller".into()],
-        properties: std::collections::BTreeMap::new(),  // rail uses inline state
+        properties: BTreeMap::new(),
         actions,
         initial_entities: vec![
             EntityState { entity_id: "train_a".into(), properties: kv(&[("status", "idle"), ("location", "platform"), ("speed", "stopped")]) },
@@ -95,25 +64,23 @@ pub fn build_rail_ontology(max_steps: usize) -> BusinessOntology {
     }
 }
 
-/// Run forward-chaining planner on a single entity
+/// Run forward-chaining planner on a single entity.
+/// Uses models::TelemetryRecord (unified type).
+/// Optionally writes to IggyBus if provided.
 pub fn run_planner(
     ont: &BusinessOntology,
     entity: &EntityState,
-    registry: &mut crate::engine::GovernanceRegistry,
-    bus: &mut IggyBus,
+    registry: &mut GovernanceRegistry,
+    bus: Option<&mut IggyBus>,
     run_id: &str,
 ) -> Vec<TelemetryRecord> {
-    let mut cap_map: HashMap<String, Vec<String>> = HashMap::new();
-    for g in &ont.capability_grants {
-        cap_map.entry(g.token.clone()).or_default().push(g.user_id.clone());
-    }
-
+    let cap_map = ont.capability_map();
     let mut state = entity.properties.clone();
     let mut telemetry = vec![];
 
     for step in 0..ont.max_timesteps {
         let t0 = std::time::Instant::now();
-        let mut fired: Option<(String, std::collections::BTreeMap<String, String>, String)> = None;
+        let mut fired: Option<(String, BTreeMap<String, String>, String)> = None;
 
         'outer: for (aname, adef) in &ont.actions {
             let users = cap_map.get(&adef.required_capability).cloned().unwrap_or_default();
@@ -134,13 +101,17 @@ pub fn run_planner(
                 state.insert(k.clone(), v.clone());
             }
             let entry = registry.record(run_id, step + 1, &user, &aname, &entity.entity_id, "EXECUTED", "");
-            bus.emit_audit(entry.to_json());
+            if let Some(b) = bus.as_deref_mut() {
+                b.emit_audit(entry.to_json());
+            }
             let rec = TelemetryRecord {
                 run_id: run_id.into(), entity_id: entity.entity_id.clone(),
                 timestep: step + 1, n_actions: 1, n_props: state.len(),
                 elapsed_us: elapsed, label: 0,
             };
-            bus.emit_telem(rec.to_json());
+            if let Some(b) = bus.as_deref_mut() {
+                b.emit_telem(rec.to_json());
+            }
             telemetry.push(rec);
         } else {
             let rec = TelemetryRecord {
@@ -148,7 +119,9 @@ pub fn run_planner(
                 timestep: step + 1, n_actions: 0, n_props: state.len(),
                 elapsed_us: elapsed, label: 1,
             };
-            bus.emit_telem(rec.to_json());
+            if let Some(b) = bus.as_deref_mut() {
+                b.emit_telem(rec.to_json());
+            }
             telemetry.push(rec);
             break;
         }

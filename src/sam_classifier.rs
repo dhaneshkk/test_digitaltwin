@@ -2,7 +2,7 @@
 //! Logistic regression with Sharpness-Aware Minimization optimizer.
 //! Bootstrap MCC with seeded RNG (seed=42) for reproducibility.
 
-use crate::planner::TelemetryRecord;
+use crate::models::TelemetryRecord;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
 // ── SAM Optimizer ────────────────────────────────────────────

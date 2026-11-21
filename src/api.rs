@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use crate::db::{self, Db};
 use crate::engine;
 use crate::models::*;
+use crate::service::{self, ServiceCtx};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,6 +50,7 @@ pub fn api_router(state: AppState) -> Router {
         .route("/api/ontologies/{id}/audit/verify", post(verify_audit))
         .route("/api/ontologies/{id}/audit/stats", get(audit_stats))
         .route("/api/ontologies/{id}/sam", post(run_sam).get(list_sam))
+        .route("/api/plan/{domain}", post(plan_domain))
         .with_state(state)
 }
 
@@ -119,14 +121,11 @@ async fn validate(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Json<Value> {
-    let onto = match db::get_ontology(&st.db, &id) {
-        Ok(Some(o)) => o,
-        Ok(None) => return err("Not found", 404),
-        Err(e) => return err(&e.to_string(), 500),
-    };
-    let report = engine::validate_ontology(&onto);
-    let _ = db::insert_validation(&st.db, &id, &report);
-    ok(serde_json::to_value(&report).unwrap())
+    let ctx = ServiceCtx::new(st.db.clone());
+    match service::validate(&ctx, &id) {
+        Ok(report) => ok(serde_json::to_value(&report).unwrap()),
+        Err(e) => err(&e, 400),
+    }
 }
 
 // ── IFD Matrix ───────────────────────────────────────────────
@@ -203,54 +202,18 @@ async fn simulate(
     Path(id): Path<String>,
     Json(body): Json<SimulateBody>,
 ) -> Json<Value> {
-    let onto = match db::get_ontology(&st.db, &id) {
-        Ok(Some(o)) => o,
-        Ok(None) => return err("Not found", 404),
-        Err(e) => return err(&e.to_string(), 500),
-    };
-
     let steps: Vec<ActionStep> = body.actions.iter().filter_map(|a| {
         if a.len() >= 3 {
             Some(ActionStep { user: a[0].clone(), action: a[1].clone(), target: a[2].clone() })
         } else { None }
     }).collect();
 
-    let result = engine::simulate(&onto, &steps);
-
-    // Persist run
-    let _ = db::insert_run(&st.db, &result.run_id, &id, &body.label, &result, &steps);
-
-    // Persist audit entries with hash chain
-    let mut prev_hash = db::get_last_chain_hash(&st.db, &id).unwrap_or_default();
-    for s in &result.successes {
-        let step = &steps[s.t];
-        let h = engine::compute_chain_hash(s.t, &step.user, &s.action, &step.target, "success", "", &prev_hash);
-        let entry = AuditEntry {
-            id: None, run_id: result.run_id.clone(), ontology_id: id.clone(),
-            timestep: s.t, user_id: step.user.clone(), action: s.action.clone(),
-            target: step.target.clone(), outcome: "success".into(),
-            detail: String::new(), chain_hash: h.clone(), created_at: None,
-        };
-        let _ = db::insert_audit_entry(&st.db, &entry);
-        prev_hash = h;
+    // Route through service layer — writes run + audit to SQLite
+    let mut ctx = ServiceCtx::new(st.db.clone());
+    match service::simulate(&mut ctx, &id, &steps, &body.label) {
+        Ok(result) => ok(serde_json::to_value(&result).unwrap()),
+        Err(e) => err(&e, 400),
     }
-    for e in &result.errors {
-        if e.t < steps.len() {
-            let step = &steps[e.t];
-            let outcome = if e.detail.contains("missing") { "error_capability" } else { "error_state" };
-            let h = engine::compute_chain_hash(e.t, &step.user, &step.action, &step.target, outcome, &e.detail, &prev_hash);
-            let entry = AuditEntry {
-                id: None, run_id: result.run_id.clone(), ontology_id: id.clone(),
-                timestep: e.t, user_id: step.user.clone(), action: step.action.clone(),
-                target: step.target.clone(), outcome: outcome.into(),
-                detail: e.detail.clone(), chain_hash: h.clone(), created_at: None,
-            };
-            let _ = db::insert_audit_entry(&st.db, &entry);
-            prev_hash = h;
-        }
-    }
-
-    ok(serde_json::to_value(&result).unwrap())
 }
 
 async fn list_runs(
@@ -290,9 +253,10 @@ async fn verify_audit(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Json<Value> {
-    match db::verify_audit_chain(&st.db, &id) {
+    let ctx = ServiceCtx::new(st.db.clone());
+    match service::verify_audit(&ctx, &id) {
         Ok((valid, count)) => ok(json!({"valid": valid, "entries_checked": count})),
-        Err(e) => err(&e.to_string(), 500),
+        Err(e) => err(&e, 500),
     }
 }
 
@@ -300,12 +264,11 @@ async fn audit_stats(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> Json<Value> {
-    let stats = db::user_stats(&st.db, &id).unwrap_or_default();
-    let patterns = db::failure_patterns(&st.db, &id).unwrap_or_default();
-    ok(json!({
-        "user_stats": stats,
-        "failure_patterns": patterns,
-    }))
+    let ctx = ServiceCtx::new(st.db.clone());
+    match service::audit_stats(&ctx, &id) {
+        Ok((stats, patterns)) => ok(json!({"user_stats": stats, "failure_patterns": patterns})),
+        Err(e) => err(&e, 500),
+    }
 }
 
 // ── SAM ──────────────────────────────────────────────────────
@@ -323,22 +286,38 @@ async fn run_sam(
     Path(id): Path<String>,
     Json(body): Json<SamBody>,
 ) -> Json<Value> {
-    let onto = match db::get_ontology(&st.db, &id) {
-        Ok(Some(o)) => o,
-        Ok(None) => return err("Not found", 404),
-        Err(e) => return err(&e.to_string(), 500),
-    };
-
     let steps: Vec<ActionStep> = body.actions.iter().filter_map(|a| {
         if a.len() >= 3 {
             Some(ActionStep { user: a[0].clone(), action: a[1].clone(), target: a[2].clone() })
         } else { None }
     }).collect();
 
-    let result = engine::sam_analysis(&onto, &steps, body.n_bootstrap);
-    let _ = db::insert_sam(&st.db, &id, &steps, &result);
+    let ctx = ServiceCtx::new(st.db.clone());
+    match service::run_sam_analysis(&ctx, &id, &steps, body.n_bootstrap) {
+        Ok(result) => ok(serde_json::to_value(&result).unwrap()),
+        Err(e) => err(&e, 400),
+    }
+}
 
-    ok(serde_json::to_value(&result).unwrap())
+// ── Plan Domain (new — exposes planner via API) ──────────────
+
+#[derive(Deserialize)]
+struct PlanBody {
+    #[serde(default = "default_steps")]
+    steps: usize,
+}
+fn default_steps() -> usize { 6 }
+
+async fn plan_domain(
+    State(st): State<AppState>,
+    Path(domain): Path<String>,
+    Json(body): Json<PlanBody>,
+) -> Json<Value> {
+    let mut ctx = ServiceCtx::new(st.db.clone());
+    match service::plan_domain(&mut ctx, &domain, body.steps) {
+        Ok(result) => ok(serde_json::to_value(&result).unwrap()),
+        Err(e) => err(&e, 400),
+    }
 }
 
 async fn list_sam(

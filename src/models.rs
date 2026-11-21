@@ -122,13 +122,34 @@ impl BusinessOntology {
         self.actions.keys().cloned().collect()
     }
 
-    /// Token → user mapping
+    /// Token → user mapping (user_id → set of tokens)
     pub fn token_map(&self) -> HashMap<String, HashSet<String>> {
         let mut map: HashMap<String, HashSet<String>> = HashMap::new();
         for g in &self.capability_grants {
             map.entry(g.user_id.clone()).or_default().insert(g.token.clone());
         }
         map
+    }
+
+    /// Capability → users mapping (token → vec of user_ids)
+    pub fn capability_map(&self) -> HashMap<String, Vec<String>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for g in &self.capability_grants {
+            map.entry(g.token.clone()).or_default().push(g.user_id.clone());
+        }
+        map
+    }
+
+    /// Convert to OntologyGraph nodes + edges for domain routing
+    pub fn to_graph(&self) -> crate::ontology_graph::OntologyGraph {
+        let mut g = crate::ontology_graph::OntologyGraph::new();
+        for entity in &self.initial_entities {
+            let props: Vec<(&str, &str)> = entity.properties.iter()
+                .map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            g.add(crate::ontology_graph::OntologyNode::new(
+                &entity.entity_id, "Entity", &props), None);
+        }
+        g
     }
 }
 
@@ -208,6 +229,52 @@ pub struct PerturbationDetail {
     pub label: String,
     pub expected_clean: bool,
     pub actual_clean: bool,
+}
+
+// ══════════════════════════════════════════════════════════════
+// Telemetry (unified — used by planner + SAM classifier + service)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryRecord {
+    pub run_id: String,
+    pub entity_id: String,
+    pub timestep: usize,
+    pub n_actions: usize,
+    pub n_props: usize,
+    pub elapsed_us: u64,
+    pub label: i32,  // 0 = ok, 1 = distressed
+}
+
+impl TelemetryRecord {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "run_id": self.run_id, "entity_id": self.entity_id,
+            "timestep": self.timestep, "n_actions": self.n_actions,
+            "n_props": self.n_props, "elapsed_us": self.elapsed_us,
+            "label": self.label,
+        })
+    }
+
+    pub fn features(&self) -> [f64; 4] {
+        [self.n_actions as f64, self.n_props as f64,
+         self.elapsed_us as f64, self.timestep as f64]
+    }
+}
+
+// ══════════════════════════════════════════════════════════════
+// Planner Result (unified output from forward-chaining planner)
+// ══════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerResult {
+    pub run_id: String,
+    pub domain: String,
+    pub telemetry: Vec<TelemetryRecord>,
+    pub n_entities: usize,
+    pub n_distressed: usize,
+    pub audit_entries: usize,
+    pub chain_valid: bool,
 }
 
 // ══════════════════════════════════════════════════════════════
