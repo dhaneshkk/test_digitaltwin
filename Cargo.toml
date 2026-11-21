@@ -1,23 +1,32 @@
 [package]
-name = "digital-twin-rs"
-version = "3.0.0"
-edition = "2024"
-rust-version = "1.85"
-description = "Universal Digital Twin Engine — Topcoat + SQLite"
+name    = "dtw"
+version = "4.0.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Digital Twin Platform v4 — Unified CLI + Web Server"
+
+[[bin]]
+name = "dtw"
+path = "src/main.rs"
 
 [dependencies]
-topcoat = "0.7"
-topcoat-ui = "0.6"
-tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["json"] }
-rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-hex = "0.4"
-rand = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
-thiserror = "2"
-once_cell = "1"
+clap        = { version = "4", features = ["derive", "env"] }
+topcoat     = "0.7"
+topcoat-ui  = "0.6"
+tokio       = { version = "1", features = ["full"] }
+axum        = { version = "0.8", features = ["json"] }
+rusqlite    = { version = "0.32", features = ["bundled", "serde_json"] }
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+sha2        = "0.10"
+uuid        = { version = "1", features = ["v4"] }
+chrono      = { version = "0.4", features = ["serde"] }
+hex         = "0.4"
+rand        = "0.8"
+tower-http  = { version = "0.6", features = ["cors"] }
+thiserror   = "2"
+once_cell   = "1"
+petgraph    = "0.6"
+reqwest     = { version = "0.12", features = ["json"] }
+colored     = "2"
+base64      = "0.22"

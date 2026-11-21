@@ -504,3 +504,82 @@ fn compute_mcc(tp: usize, tn: usize, fp: usize, r#fn: usize) -> f64 {
         0.0
     }
 }
+
+// ══════════════════════════════════════════════════════════════
+// Governance Registry (v4 — used by planner + CLI audit)
+// SHA-256 chained, in-memory, with record() + verify_chain()
+// ══════════════════════════════════════════════════════════════
+
+fn sha256_hex(data: &str) -> String {
+    let hash = Sha256::digest(data.as_bytes());
+    hex::encode(&hash[..16])
+}
+
+#[derive(Clone)]
+pub struct GovAuditEntry {
+    pub timestamp: String,
+    pub run_id: String,
+    pub timestep: usize,
+    pub user: String,
+    pub action: String,
+    pub target: String,
+    pub outcome: String,
+    pub detail: String,
+    pub hash: String,
+}
+
+impl GovAuditEntry {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "ts": self.timestamp, "run_id": self.run_id,
+            "timestep": self.timestep, "user": self.user,
+            "action": self.action, "target": self.target,
+            "outcome": self.outcome, "hash": self.hash,
+        })
+    }
+}
+
+pub struct GovernanceRegistry {
+    pub entries: Vec<GovAuditEntry>,
+    prev_hash: String,
+}
+
+impl GovernanceRegistry {
+    pub fn new() -> Self {
+        Self { entries: vec![], prev_hash: String::new() }
+    }
+
+    pub fn record(
+        &mut self, run_id: &str, timestep: usize, user: &str,
+        action: &str, target: &str, outcome: &str, detail: &str,
+    ) -> GovAuditEntry {
+        let ts = chrono::Utc::now().to_rfc3339();
+        let payload = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            self.prev_hash, ts, run_id, timestep, user, action, target, outcome, detail
+        );
+        let hash = sha256_hex(&payload);
+        self.prev_hash = hash.clone();
+        let e = GovAuditEntry {
+            timestamp: ts, run_id: run_id.into(), timestep,
+            user: user.into(), action: action.into(), target: target.into(),
+            outcome: outcome.into(), detail: detail.into(), hash,
+        };
+        self.entries.push(e.clone());
+        e
+    }
+
+    pub fn verify_chain(&self) -> bool {
+        let mut ph = String::new();
+        for e in &self.entries {
+            let payload = format!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                ph, e.timestamp, e.run_id, e.timestep,
+                e.user, e.action, e.target, e.outcome, e.detail
+            );
+            if sha256_hex(&payload) != e.hash { return false; }
+            ph = e.hash.clone();
+        }
+        true
+    }
+}
