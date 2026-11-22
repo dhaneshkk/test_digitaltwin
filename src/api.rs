@@ -65,7 +65,12 @@ fn err(msg: &str, _status: u16) -> Json<Value> {
 
 async fn health(State(st): State<AppState>) -> Json<Value> {
     let _ = st.db.lock().unwrap();
-    ok(json!({"status": "ok", "db": "sqlite"}))
+    let ctx = ServiceCtx::new(st.db.clone());
+    ok(json!({
+        "status": "ok",
+        "db": "sqlite",
+        "vesdb": service::vesdb_status(&ctx),
+    }))
 }
 
 // ── Ontology CRUD ────────────────────────────────────────────
@@ -255,7 +260,7 @@ async fn verify_audit(
 ) -> Json<Value> {
     let ctx = ServiceCtx::new(st.db.clone());
     match service::verify_audit(&ctx, &id) {
-        Ok((valid, count)) => ok(json!({"valid": valid, "entries_checked": count})),
+        Ok(vr) => ok(serde_json::to_value(&vr).unwrap()),
         Err(e) => err(&e, 500),
     }
 }

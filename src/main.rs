@@ -1,7 +1,8 @@
 //! Digital Twin Platform v4 — Unified CLI + Web Server
 //!
-//! All operations route through service.rs → SQLite + optional Iggy.
-//! No split data paths. CLI and web API share the same DB.
+//! All operations route through service.rs:
+//!   Audit → Vesdb (tamper-evident) + SQLite (fallback) + Iggy (stream)
+//!   Relational data → SQLite only
 //!
 //! dtw lean4                            [IGG-04]
 //! dtw domains
@@ -24,6 +25,7 @@ mod planner;
 mod qa;
 mod sam_classifier;
 mod service;
+mod vesdb;
 
 use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
@@ -39,6 +41,10 @@ struct Cli {
     #[arg(long, global=true, default_value="127.0.0.1")] iggy_host: String,
     #[arg(long, global=true, default_value="3000")]       iggy_port: u16,
     #[arg(long, global=true, env="GEMINI_API_KEY", default_value="")] api_key: String,
+    /// Vesdb URL (tamper-evident audit store)
+    #[arg(long, global=true, env="VESDB_URL", default_value="")] vesdb_url: String,
+    /// Vesdb stream name for audit events
+    #[arg(long, global=true, default_value="dtw-audit")] vesdb_stream: String,
     #[command(subcommand)] command: Command,
 }
 
@@ -102,6 +108,9 @@ fn cmd_simulate(a: SimArgs, ctx: &mut ServiceCtx) {
                 result.audit_entries,
                 if result.chain_valid {"✓".green().to_string()} else {"✗".red().to_string()});
             println!("  Persisted   : ✓ SQLite (digital_twin.db)");
+            if ctx.vesdb.as_ref().map_or(false, |v| v.connected) {
+                println!("  Vesdb       : ✓ tamper-evident audit");
+            }
         }
         Err(e) => println!("  {} {}", "ERROR".red(), e),
     }
@@ -141,8 +150,20 @@ fn cmd_audit(a: SimArgs, ctx: &mut ServiceCtx) {
 
     sep("Chain Verification");
     match service::verify_audit(ctx, &ont_id) {
-        Ok((valid, count)) => println!("  Entries: {}  Intact: {}",
-            count, if valid {"✓ VALID".green().to_string()} else {"✗ TAMPERED".red().to_string()}),
+        Ok(vr) => {
+            println!("  Backend : {}", vr.backend.cyan());
+            println!("  Entries : {}  Valid: {}", vr.entries_checked,
+                if vr.valid {"✓".green().to_string()} else {"✗ TAMPERED".red().to_string()});
+            if let Some(root) = &vr.merkle_root {
+                println!("  Merkle  : {}", root.dimmed());
+            }
+            if let Some(w) = vr.witness_cosignatures {
+                println!("  Witness : {} cosignatures", w);
+            }
+            for e in &vr.errors {
+                println!("  {} {}", "⚠".yellow(), e);
+            }
+        }
         Err(e) => println!("  {} {}", "ERROR".red(), e),
     }
 
@@ -221,10 +242,15 @@ async fn main() {
         Command::Domains => cmd_domains(),
         Command::Serve(a) => cmd_serve(a).await,
         cmd => {
-            // All CLI subcommands share one ServiceCtx → one DB + one Iggy
+            // All CLI subcommands share one ServiceCtx → DB + Vesdb + Iggy
             let _ = &*DB;
             let mut ctx = ServiceCtx::new(DB.clone())
                 .with_iggy(&cli.iggy_host, cli.iggy_port);
+
+            // Wire Vesdb if URL provided
+            if !cli.vesdb_url.is_empty() {
+                ctx = ctx.with_vesdb(&cli.vesdb_url, &cli.vesdb_stream);
+            }
 
             match cmd {
                 Command::Simulate(a)  => cmd_simulate(a, &mut ctx),
@@ -234,8 +260,11 @@ async fn main() {
                 Command::Qa(a)        => cmd_qa(a, &mut ctx, &cli.api_key),
                 _ => unreachable!(),
             }
+            if let Some(vesdb) = &ctx.vesdb {
+                println!("  {}", format!("[Vesdb] {}", vesdb.status_line()).dimmed());
+            }
             if let Some(bus) = &ctx.bus {
-                println!("\n  {}", format!("[Iggy] {}", bus.status_line()).dimmed());
+                println!("  {}", format!("[Iggy] {}", bus.status_line()).dimmed());
             }
         }
     }
